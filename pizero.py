@@ -1,0 +1,271 @@
+import openai
+import sounddevice as sd
+import numpy as np
+import scipy.io.wavfile as wav
+from pydub import AudioSegment
+import pyaudio
+import threading
+import io
+import time
+import re
+import queue
+from dotenv import load_dotenv
+import os
+from gpiozero import Button, LED
+
+# Load environment variables
+load_dotenv()
+OPENAI_API_KEY = os.getenv("API_KEY")
+OPENAI_HOST = "https://api.openai.com/v1/"
+LOCAL_API_KEY = "not-needed"
+
+# Configuration Constants
+LOCAL_STT_CONFIG = {
+    "BASE_URL": "http://10.1.1.24:8000/v1",
+    "MODEL": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "API_KEY": LOCAL_API_KEY,
+}
+
+LOCAL_LLM_CONFIG = {
+    "BASE_URL": "http://10.1.1.24:11434/v1",
+    "MODEL": "gemma3:12b",
+    "API_KEY": LOCAL_API_KEY,
+}
+
+LOCAL_TTS_CONFIG = {
+    "BASE_URL": "http://10.1.1.24:8880/v1",
+    "MODEL": "kokoro",
+    "VOICE": "fable",
+    "API_KEY": LOCAL_API_KEY,
+}
+
+OPENAI_STT_CONFIG = {
+    "BASE_URL": OPENAI_HOST,
+    "MODEL": "whisper-1",
+    "API_KEY": OPENAI_API_KEY,
+}
+
+OPENAI_LLM_CONFIG = {
+    "BASE_URL": OPENAI_HOST,
+    "MODEL": "gpt-4o-mini",
+    "API_KEY": OPENAI_API_KEY,
+}
+
+OPENAI_TTS_CONFIG = {
+    "BASE_URL": OPENAI_HOST,
+    "MODEL": "tts-1",
+    "VOICE": "fable",
+    "API_KEY": OPENAI_API_KEY,
+}
+
+# Select which configurations to use
+STT_CONFIG = LOCAL_STT_CONFIG
+LLM_CONFIG = LOCAL_LLM_CONFIG
+TTS_CONFIG = LOCAL_TTS_CONFIG
+
+# Initialize conversation history
+conversation_history = [
+    {
+        "role": "system",
+        "content": "You are a voice assistant. Respond concisely and avoid using emojis or markdown formatting.",
+    }
+]
+
+# Initialize clients with respective configurations
+stt_client = openai.OpenAI(
+    base_url=STT_CONFIG["BASE_URL"], api_key=STT_CONFIG["API_KEY"]
+)
+llm_client = openai.OpenAI(
+    base_url=LLM_CONFIG["BASE_URL"], api_key=LLM_CONFIG["API_KEY"]
+)
+tts_client = openai.OpenAI(
+    base_url=TTS_CONFIG["BASE_URL"], api_key=TTS_CONFIG["API_KEY"]
+)
+
+# Audio settings
+SAMPLE_RATE = 16000
+CHANNELS = 1
+DTYPE = np.int16
+RECORDING = False
+audio_buffer = []
+
+# Initialize GPIO
+button = Button(26, bounce_time=0.1)
+led_recording = LED(22)  # Red LED for recording
+led_processing = LED(27)  # Yellow LED for processing
+led_speaking = LED(17)   # Green LED for speaking
+
+# Audio playback setup
+audio = pyaudio.PyAudio()
+audio_queue = queue.Queue()
+stream = audio.open(
+    format=pyaudio.paInt16,
+    channels=1,
+    rate=24000,
+    output=True,
+    start=False,
+    frames_per_buffer=1024,
+)
+
+# Update LED states
+def update_leds(recording=False, processing=False, speaking=False):
+    if recording:
+        led_recording.on()
+    else:
+        led_recording.off()
+        
+    if processing:
+        led_processing.blink(on_time=0.5, off_time=0.5)
+    else:
+        led_processing.off()
+        
+    if speaking:
+        led_speaking.on()
+    else:
+        led_speaking.off()
+
+# Add playback thread
+def playback_worker():
+    while True:
+        data = audio_queue.get()
+        if data is None:
+            break
+        update_leds(recording=False, processing=False, speaking=True)
+        stream.write(data)
+        update_leds(recording=False, processing=False, speaking=False)
+
+playback_thread = threading.Thread(target=playback_worker, daemon=True)
+playback_thread.start()
+
+def record_callback(indata, frames, time, status):
+    if RECORDING:
+        audio_buffer.append(indata.copy())
+
+def play_audio(audio_bytes):
+    audio_queue.put(audio_bytes)
+
+def transcribe_audio(filename):
+    with open(filename, "rb") as audio_file:
+        transcription = stt_client.audio.transcriptions.create(
+            model=STT_CONFIG["MODEL"], file=audio_file
+        )
+    return transcription.text
+
+def generate_speech(text):
+    response = tts_client.audio.speech.create(
+        model=TTS_CONFIG["MODEL"], voice=TTS_CONFIG["VOICE"], input=text
+    )
+    return response.content
+
+def on_button_press():
+    global RECORDING
+    if not RECORDING:
+        print("Recording...")
+        RECORDING = True
+        update_leds(recording=True, processing=False, speaking=False)
+
+def on_button_release():
+    global RECORDING, conversation_history
+    if RECORDING:
+        print("Processing...")
+        RECORDING = False
+        update_leds(recording=False, processing=True, speaking=False)
+
+        # Save recorded audio
+        audio_data = np.concatenate(audio_buffer, axis=0)
+        wav.write("input.wav", SAMPLE_RATE, audio_data)
+        audio_buffer.clear()
+
+        # Process audio
+        transcript = transcribe_audio("input.wav")
+        print(f"You: {transcript}")
+
+        # Add user message to history
+        conversation_history.append({"role": "user", "content": transcript})
+
+        # Stream LLM response
+        llm_stream = llm_client.chat.completions.create(
+            model=LLM_CONFIG["MODEL"], messages=conversation_history, stream=True
+        )
+
+        buffer = ""
+        full_response = ""
+        stream.start_stream()
+        for chunk in llm_stream:
+            content = chunk.choices[0].delta.content
+            if content is not None:
+                buffer += content
+                full_response += content
+                sentences = []
+                while True:
+                    match = re.search(r"[.!?](?:\s+|$)", buffer)
+                    if match:
+                        end_pos = match.end()
+                        sentence = buffer[:end_pos].strip()
+                        sentences.append(sentence)
+                        buffer = buffer[end_pos:].lstrip()
+                    else:
+                        break
+
+                # Process sentences
+                for sentence in sentences:
+                    print(f"Assistant: {repr(sentence)}")
+                    speech = generate_speech(sentence)
+                    audio = AudioSegment.from_mp3(io.BytesIO(speech))
+                    audio = audio.set_frame_rate(24000).set_channels(1)
+                    play_audio(audio.raw_data)
+
+        # Process remaining buffer
+        if buffer.strip():
+            print(f"Assistant: {buffer}")
+            speech = generate_speech(buffer)
+            audio = AudioSegment.from_mp3(io.BytesIO(speech))
+            audio = audio.set_frame_rate(24000).set_channels(1)
+            play_audio(audio.raw_data)
+
+        # Add assistant response to history
+        conversation_history.append(
+            {"role": "assistant", "content": full_response.strip()}
+        )
+        
+        # Reset LEDs after processing
+        update_leds(recording=False, processing=False, speaking=False)
+
+def main():
+    # Start audio stream
+    input_stream = sd.InputStream(
+        samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE, callback=record_callback
+    )
+    input_stream.start()
+
+    print("Press and hold button to talk")
+    
+    # Setup button event handlers
+    button.when_pressed = on_button_press
+    button.when_released = on_button_release
+    
+    # Initial LED setup - all LEDs off
+    update_leds(recording=False, processing=False, speaking=False)
+    
+    try:
+        # Keep the program running
+        while True:
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Clean up
+        input_stream.stop()
+        input_stream.close()
+        audio_queue.put(None)  # Stop playback thread
+        stream.close()
+        audio.terminate()
+        
+        # Turn off all LEDs
+        led_recording.off()
+        led_processing.off()
+        led_speaking.off()
+
+if __name__ == "__main__":
+    print('Starting... Voice Assistant Chatbox')
+    main()
